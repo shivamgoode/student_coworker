@@ -5,11 +5,11 @@ import {
   ReactFlow,
   Background,
   Controls,
+  Position,
   useNodesState,
   useEdgesState,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import dagre from 'dagre';
 import { api } from '../api/client';
 
 /* ============================
@@ -124,37 +124,136 @@ function FlowchartViewer({ data }) {
   const [graphHeight, setGraphHeight] = useState(400);
 
   useEffect(() => {
-    if (!data?.nodes) return;
+    if (!data?.nodes?.length) return;
 
-    const g = new dagre.graphlib.Graph();
-    g.setDefaultEdgeLabel(() => ({}));
-    g.setGraph({ rankdir: 'LR', nodesep: 50, ranksep: 60 });
+    const nodeWidth = 180;
+    const nodeHeight = 56;
+    const verticalGap = 96;
+    const horizontalGap = 260;
 
-    const nodeWidth = 140;
-    const nodeHeight = 50;
-    data.nodes.forEach((n) => g.setNode(n.id, { width: nodeWidth, height: nodeHeight }));
-    (data.edges || []).forEach((e) => g.setEdge(e.source, e.target));
-    dagre.layout(g);
+    const outgoing = new Map(data.nodes.map((n) => [n.id, []]));
+    const incomingCount = new Map(data.nodes.map((n) => [n.id, 0]));
 
-    const graphInfo = g.graph();
-    setGraphHeight(Math.max(500, (graphInfo.height || 0) + 150));
+    (data.edges || []).forEach((e) => {
+      if (!outgoing.has(e.source)) outgoing.set(e.source, []);
+      outgoing.get(e.source).push(e.target);
+      incomingCount.set(e.target, (incomingCount.get(e.target) || 0) + 1);
+    });
+
+    const rootNode =
+      data.nodes.find((n) => n.type === 'input')
+      || data.nodes.find((n) => (incomingCount.get(n.id) || 0) === 0)
+      || data.nodes[0];
+
+    const levels = new Map([[rootNode.id, 0]]);
+    const parent = new Map();
+    const queue = [rootNode.id];
+    const visited = new Set([rootNode.id]);
+
+    while (queue.length) {
+      const current = queue.shift();
+      const children = outgoing.get(current) || [];
+      children.forEach((childId) => {
+        if (!visited.has(childId)) {
+          visited.add(childId);
+          parent.set(childId, current);
+          levels.set(childId, (levels.get(current) || 0) + 1);
+          queue.push(childId);
+        }
+      });
+    }
+
+    const treeChildren = new Map(data.nodes.map((n) => [n.id, []]));
+    parent.forEach((p, childId) => {
+      treeChildren.get(p).push(childId);
+    });
+
+    const side = new Map([[rootNode.id, 0]]);
+    const firstLevel = treeChildren.get(rootNode.id) || [];
+    firstLevel.forEach((id, index) => {
+      side.set(id, index % 2 === 0 ? 1 : -1);
+    });
+
+    const sideQueue = [...firstLevel];
+    while (sideQueue.length) {
+      const current = sideQueue.shift();
+      const currentSide = side.get(current) || 1;
+      (treeChildren.get(current) || []).forEach((child) => {
+        side.set(child, currentSide);
+        sideQueue.push(child);
+      });
+    }
+
+    // Place disconnected nodes on the right so every node is visible.
+    data.nodes.forEach((n) => {
+      if (!visited.has(n.id)) {
+        visited.add(n.id);
+        levels.set(n.id, 1);
+        side.set(n.id, 1);
+      }
+    });
+
+    const maxLevel = Math.max(...Array.from(levels.values()));
+    const centerX = maxLevel * horizontalGap + 80;
+
+    const leftNodes = data.nodes
+      .filter((n) => (side.get(n.id) || 0) < 0)
+      .sort((a, b) => (levels.get(a.id) || 0) - (levels.get(b.id) || 0));
+    const rightNodes = data.nodes
+      .filter((n) => (side.get(n.id) || 0) > 0)
+      .sort((a, b) => (levels.get(a.id) || 0) - (levels.get(b.id) || 0));
+
+    const sideCount = Math.max(leftNodes.length, rightNodes.length);
+    const centerY = Math.max(260, sideCount * verticalGap * 0.65);
+    const nodePositions = new Map([[rootNode.id, { x: centerX, y: centerY }]]);
+
+    leftNodes.forEach((n, i) => {
+      const lvl = levels.get(n.id) || 1;
+      nodePositions.set(n.id, {
+        x: centerX - lvl * horizontalGap,
+        y: centerY + (i - (leftNodes.length - 1) / 2) * verticalGap,
+      });
+    });
+
+    rightNodes.forEach((n, i) => {
+      const lvl = levels.get(n.id) || 1;
+      nodePositions.set(n.id, {
+        x: centerX + lvl * horizontalGap,
+        y: centerY + (i - (rightNodes.length - 1) / 2) * verticalGap,
+      });
+    });
+
+    const totalRows = Math.max(3, sideCount + 2);
+    setGraphHeight(totalRows * verticalGap);
 
     setNodes(
       data.nodes.map((n) => {
-        const pos = g.node(n.id);
+        const pos = nodePositions.get(n.id) || { x: centerX, y: centerY };
+        const nodeSide = side.get(n.id) || 0;
+        const isRoot = n.id === rootNode.id;
+        const isOutput = n.type === 'output';
         return {
           id: n.id,
           data: { label: n.label },
           position: { x: pos.x - nodeWidth / 2, y: pos.y - nodeHeight / 2 },
-          type: n.type === 'input' ? 'input' : n.type === 'output' ? 'output' : 'default',
+          type: 'default',
+          sourcePosition: nodeSide < 0 ? Position.Left : Position.Right,
+          targetPosition: nodeSide < 0 ? Position.Right : Position.Left,
           style: {
-            background: n.type === 'input' ? '#00f0ff' : n.type === 'output' ? '#ec4899' : '#1e293b',
+            background: isRoot
+              ? 'linear-gradient(135deg, #22d3ee, #06b6d4)'
+              : isOutput
+                ? 'linear-gradient(135deg, #fb7185, #ec4899)'
+                : 'linear-gradient(135deg, #1f2937, #111827)',
             color: '#fff',
-            border: '1px solid rgba(255,255,255,0.08)',
-            borderRadius: '10px',
-            padding: '8px 14px',
-            fontSize: '11px',
-            maxWidth: '160px',
+            border: isRoot ? '1px solid rgba(34,211,238,0.85)' : '1px solid rgba(255,255,255,0.12)',
+            borderRadius: '999px',
+            padding: '10px 16px',
+            fontSize: '12px',
+            fontWeight: 600,
+            maxWidth: '220px',
+            textAlign: 'center',
+            boxShadow: isRoot ? '0 0 28px rgba(34,211,238,0.35)' : '0 6px 20px rgba(0,0,0,0.25)',
           },
         };
       })
@@ -165,9 +264,10 @@ function FlowchartViewer({ data }) {
         id: `e-${i}`,
         source: e.source,
         target: e.target,
+        type: 'smoothstep',
         label: e.label || '',
-        animated: true,
-        style: { stroke: '#00f0ff' },
+        animated: false,
+        style: { stroke: '#38bdf8', strokeWidth: 1.8 },
         labelStyle: { fill: '#94a3b8', fontSize: '10px' },
       }))
     );

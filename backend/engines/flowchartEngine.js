@@ -6,6 +6,45 @@
  */
 const groq = require('../config/groq');
 
+function hasNonEnglishFlowchartText(flowchart) {
+  const devanagariRegex = /[\u0900-\u097F]/;
+  const textParts = [];
+
+  (flowchart.steps || []).forEach((s) => textParts.push(String(s || '')));
+  (flowchart.nodes || []).forEach((n) => textParts.push(String(n.label || '')));
+  (flowchart.edges || []).forEach((e) => textParts.push(String(e.label || '')));
+
+  return textParts.some((t) => devanagariRegex.test(t));
+}
+
+async function translateFlowchartToEnglish(flowchart) {
+  const response = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      {
+        role: 'system',
+        content: `You are a JSON translator.
+Translate all human-readable text values in this flowchart JSON to clear English.
+Preserve structure exactly:
+- Keep all keys unchanged.
+- Keep all node ids unchanged.
+- Keep node type values unchanged (input/default/output).
+- Keep edge source/target unchanged.
+Translate only labels and step text.
+Return ONLY valid JSON.`,
+      },
+      {
+        role: 'user',
+        content: JSON.stringify(flowchart),
+      },
+    ],
+    temperature: 0.1,
+    max_tokens: 4096,
+  });
+
+  return JSON.parse(response.choices[0].message.content.trim());
+}
+
 /**
  * Generate flowchart nodes and edges from transcript.
  * @param {string} transcript - text describing a process or concept
@@ -19,7 +58,8 @@ async function generateFlowchart(transcript) {
         {
           role: 'system',
           content: `You are a flowchart generator. The text may be in English, Hindi (Devanagari), or Hinglish (mixed Hindi-English). Understand the content regardless of language.
-Break down the concept/process into sequential steps. Use the same language as the input for step descriptions and labels.
+Break down the concept/process into sequential steps.
+ALWAYS output all step descriptions, node labels, and edge labels in English only.
 For longer content (lectures), create a DETAILED flowchart covering ALL major steps, decisions, and branches — not just 3-4 nodes.
 
 Return JSON:
@@ -53,7 +93,13 @@ Return ONLY valid JSON, no markdown.`,
     });
 
     const content = response.choices[0].message.content.trim();
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+
+    if (hasNonEnglishFlowchartText(parsed)) {
+      return await translateFlowchartToEnglish(parsed);
+    }
+
+    return parsed;
   } catch (error) {
     console.error('[FlowchartEngine] Generation failed:', error.message);
     return {
